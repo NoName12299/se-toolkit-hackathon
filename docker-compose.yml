@@ -1,0 +1,49 @@
+services:
+  # ── PostgreSQL database ──────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: links-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-linksdb}
+      POSTGRES_USER: ${DB_USER:-linksuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-linkspassword}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-linksuser} -d ${DB_NAME:-linksdb}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Telegram bot ─────────────────────────────────────────────────
+  bot:
+    build: ./bot
+    container_name: links-bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Telegram
+      BOT_TOKEN: ${BOT_TOKEN}
+      # LLM
+      LLM_API_BASE_URL: ${LLM_API_BASE_URL:-http://host.docker.internal:8080/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-my-secret-qwen-key}
+      LLM_MODEL: ${LLM_MODEL:-coder-model}
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-linksdb}
+      DB_USER: ${DB_USER:-linksuser}
+      DB_PASSWORD: ${DB_PASSWORD:-linkspassword}
+    # On Linux, host.docker.internal doesn't work by default.
+    # extra_hosts maps it to the host gateway so the bot can reach
+    # the LLM running on the host machine.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  pgdata:
