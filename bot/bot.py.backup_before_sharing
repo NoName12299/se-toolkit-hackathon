@@ -23,8 +23,6 @@ import json
 import logging
 import os
 import re
-import secrets
-import string
 import sys
 import time
 from contextlib import suppress
@@ -121,44 +119,7 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
             CREATE INDEX IF NOT EXISTS idx_links_folder_id ON links(folder_id);
         """)
 
-        # Create shared_folders table (for sharing folders via access keys)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS shared_folders (
-                id          SERIAL PRIMARY KEY,
-                folder_id   INT       NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
-                access_key  TEXT      NOT NULL UNIQUE,
-                created_by  BIGINT    NOT NULL,
-                mode        TEXT      DEFAULT 'read',
-                created_at  TIMESTAMP DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_shared_folders_access_key ON shared_folders(access_key);
-            CREATE INDEX IF NOT EXISTS idx_shared_folders_folder_id ON shared_folders(folder_id);
-            CREATE INDEX IF NOT EXISTS idx_shared_folders_created_by ON shared_folders(created_by);
-        """)
-
-        # Create shared_access table (for tracking which users have access to shared folders)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS shared_access (
-                id          SERIAL PRIMARY KEY,
-                folder_id   INT       NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
-                user_id     BIGINT    NOT NULL,
-                granted_by  BIGINT    NOT NULL,
-                mode        TEXT      DEFAULT 'read',
-                granted_at  TIMESTAMP DEFAULT NOW(),
-                UNIQUE(folder_id, user_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_shared_access_folder_id ON shared_access(folder_id);
-            CREATE INDEX IF NOT EXISTS idx_shared_access_user_id ON shared_access(user_id);
-            CREATE INDEX IF NOT EXISTS idx_shared_access_granted_by ON shared_access(granted_by);
-        """)
-
-        # Add mode column if it doesn't exist (migration for existing tables)
-        await conn.execute("""
-            ALTER TABLE shared_folders ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'read';
-            ALTER TABLE shared_access ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'read';
-        """)
-
-        logger.info("Schema ensured (folders, links, shared_folders, shared_access tables exist, folder_id column present)")
+        logger.info("Schema ensured (folders and links tables exist, folder_id column present)")
 
 
 # --- Folder DB helpers ---
@@ -310,167 +271,6 @@ async def delete_folder(pool: asyncpg.Pool, user_id: int, folder_id: int) -> tup
         return True, folder["name"]
 
 
-# --- Shared folders DB helpers ---
-
-def generate_share_key(folder_name: str) -> str:
-    """Generate a share key: folder_name_abc123 (6 random alphanumeric chars)."""
-    chars = string.ascii_lowercase + string.digits
-    random_part = ''.join(secrets.choice(chars) for _ in range(6))
-    return f"{folder_name}_{random_part}"
-
-
-async def get_existing_share_key(pool: asyncpg.Pool, folder_id: int) -> dict | None:
-    """Get existing share key for a folder, or None if not shared. Returns dict with access_key and mode."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT access_key, mode FROM shared_folders WHERE folder_id = $1",
-            folder_id,
-        )
-        if row:
-            return {"access_key": row["access_key"], "mode": row["mode"]}
-        return None
-
-
-async def create_share_key(pool: asyncpg.Pool, folder_id: int, created_by: int, access_key: str, mode: str = 'read') -> None:
-    """Insert a new share key into shared_folders."""
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO shared_folders (folder_id, access_key, created_by, mode) VALUES ($1, $2, $3, $4)",
-            folder_id, access_key, created_by, mode,
-        )
-
-
-async def get_folder_by_share_key(pool: asyncpg.Pool, access_key: str) -> dict | None:
-    """Get folder info by share key."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT f.id, f.name, f.user_id as owner_id, sf.access_key, sf.created_by, sf.mode
-            FROM shared_folders sf
-            INNER JOIN folders f ON sf.folder_id = f.id
-            WHERE sf.access_key = $1
-        """, access_key)
-        if row:
-            return {
-                "id": row["id"], "name": row["name"], "owner_id": row["owner_id"],
-                "access_key": row["access_key"], "created_by": row["created_by"],
-                "mode": row["mode"],
-            }
-        return None
-
-
-async def grant_folder_access(pool: asyncpg.Pool, folder_id: int, user_id: int, granted_by: int, mode: str = 'read') -> bool:
-    """Grant access to a shared folder. Returns True if granted, False if already exists."""
-    async with pool.acquire() as conn:
-        try:
-            await conn.execute(
-                "INSERT INTO shared_access (folder_id, user_id, granted_by, mode) VALUES ($1, $2, $3, $4)",
-                folder_id, user_id, granted_by, mode,
-            )
-            return True
-        except asyncpg.UniqueViolationError:
-            return False
-
-
-async def get_user_access_mode(pool: asyncpg.Pool, folder_id: int, user_id: int) -> str | None:
-    """Get user's access mode for a folder. Returns 'read', 'write', or None."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT mode FROM shared_access WHERE folder_id = $1 AND user_id = $2",
-            folder_id, user_id,
-        )
-        return row["mode"] if row else None
-
-
-async def has_folder_access(pool: asyncpg.Pool, folder_id: int, user_id: int) -> bool:
-    """Check if user has access to a shared folder."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id FROM shared_access WHERE folder_id = $1 AND user_id = $2",
-            folder_id, user_id,
-        )
-        return row is not None
-
-
-async def get_shared_folder_users(pool: asyncpg.Pool, folder_id: int) -> list[dict]:
-    """Get all users with access to a shared folder."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT sa.user_id, sa.mode, sa.granted_at, f.name as folder_name
-            FROM shared_access sa
-            INNER JOIN folders f ON sa.folder_id = f.id
-            WHERE sa.folder_id = $1
-            ORDER BY sa.granted_at DESC
-        """, folder_id)
-        return [{
-            "user_id": r["user_id"], "mode": r["mode"],
-            "granted_at": r["granted_at"], "folder_name": r["folder_name"],
-        } for r in rows]
-
-
-async def revoke_share_key(pool: asyncpg.Pool, folder_id: int, user_id: int) -> tuple[bool, str]:
-    """
-    Revoke access to a shared folder.
-    Returns (success: bool, message: str).
-    Only the folder owner can revoke access.
-    """
-    async with pool.acquire() as conn:
-        # Check if folder exists and get owner info
-        folder = await conn.fetchrow(
-            "SELECT id, user_id, name, is_system FROM folders WHERE id = $1",
-            folder_id,
-        )
-        
-        if not folder:
-            return False, "Folder not found"
-        
-        # Cannot revoke System folder
-        if folder["is_system"]:
-            return False, "Cannot revoke System folder"
-        
-        # Check if caller is the folder owner
-        if folder["user_id"] != user_id:
-            return False, "Only the folder owner can revoke access"
-        
-        # Check if folder is actually shared
-        share_record = await conn.fetchrow(
-            "SELECT id FROM shared_folders WHERE folder_id = $1",
-            folder_id,
-        )
-        
-        if not share_record:
-            return False, f"Folder '{folder['name']}' is not shared"
-        
-        # Delete all access records
-        await conn.execute(
-            "DELETE FROM shared_access WHERE folder_id = $1",
-            folder_id,
-        )
-        
-        # Delete the share key record
-        await conn.execute(
-            "DELETE FROM shared_folders WHERE folder_id = $1",
-            folder_id,
-        )
-        
-        return True, folder["name"]
-
-
-async def get_user_shared_folders(pool: asyncpg.Pool, user_id: int) -> list[dict]:
-    """Get all folders shared with a user."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT f.id, f.name, f.user_id as owner_id, sa.granted_by, sa.granted_at
-            FROM shared_access sa
-            INNER JOIN folders f ON sa.folder_id = f.id
-            WHERE sa.user_id = $1
-            ORDER BY sa.granted_at DESC
-        """, user_id)
-        return [{
-            "id": r["id"], "name": r["name"], "owner_id": r["owner_id"],
-            "granted_by": r["granted_by"], "granted_at": r["granted_at"],
-        } for r in rows]
-
-
 # --- Link DB helpers ---
 
 async def add_link(pool: asyncpg.Pool, user_id: int, url: str, description: str, folder_id: int | None = None) -> int:
@@ -551,13 +351,13 @@ async def get_links_by_url(pool: asyncpg.Pool, user_id: int, url: str) -> list[d
     """Get all links matching a URL for a user, with folder info."""
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT l.id, l.user_id, l.url, l.description, l.folder_id, f.name as folder_name, f.is_system
+            SELECT l.id, l.url, l.description, l.folder_id, f.name as folder_name, f.is_system
             FROM links l
             LEFT JOIN folders f ON l.folder_id = f.id
             WHERE l.user_id = $1 AND l.url = $2
         """, user_id, url)
         return [{
-            "id": r["id"], "user_id": r["user_id"], "url": r["url"], "description": r["description"],
+            "id": r["id"], "url": r["url"], "description": r["description"],
             "folder_id": r["folder_id"], "folder_name": r["folder_name"], "is_system": r["is_system"],
         } for r in rows]
 
@@ -970,85 +770,20 @@ router = Router()
 async def cmd_start(message: Message):
     """Handle /start command."""
     await message.answer(
-        "👋 <b>Welcome to the Link Saver Bot!</b>\n\n"
-        "Save, organize, and find your favorite links using AI-powered semantic search.\n"
-        "Share folders with your team and collaborate on curated link collections.\n\n"
-        "📖 <b>Quick Start:</b>\n"
-        "  1. <code>/create Work</code> — Create your first folder\n"
-        "  2. <code>/add https://example.com \"My site\" --folder Work</code> — Save a link\n"
-        "  3. <code>/find python</code> — Search with AI\n"
-        "  4. <code>/share Work</code> — Share with others\n\n"
-        "📚 <b>Commands:</b> Use /help for full command list\n\n"
-        "💡 <b>Tip:</b> You can also use natural language like\n"
-        "  <code>find python tutorial</code> or <code>show folders</code>",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("help"))
-async def cmd_help(message: Message):
-    """Handle /help command — show all available commands."""
-    await message.answer(
-        "📖 <b>Link Saver Bot — Full Command Reference</b>\n\n"
-        
-        "📂 <b>FOLDER MANAGEMENT</b>\n"
-        "  <code>/create &lt;name&gt;</code>\n"
-        "    Create a new folder\n\n"
-        "  <code>/folders</code>\n"
-        "    List all your folders (own, shared, and system)\n\n"
-        "  <code>/folder &lt;name&gt;</code>\n"
-        "    Show all links in a specific folder\n\n"
-        "  <code>/delete_folder &lt;name&gt;</code>\n"
-        "    Delete an empty folder (must have no links)\n\n"
-        
-        "🔗 <b>LINK MANAGEMENT</b>\n"
-        "  <code>/add &lt;url&gt; \"&lt;description&gt;\" [--folder &lt;name&gt;]</code>\n"
-        "    Save a link with description to a folder\n"
-        "    Example: <code>/add https://python.org \"Python docs\" --folder Work</code>\n\n"
-        "  <code>/delete &lt;url&gt;</code>\n"
-        "    Delete your link(s) by URL\n"
-        "    Note: Can only delete your own links (or all if you own the folder)\n\n"
-        "  <code>/edit &lt;url&gt; \"&lt;new description&gt;\"</code>\n"
-        "    Update the description of an existing link\n\n"
-        "  <code>/list</code>\n"
-        "    Show all your links grouped by folder\n\n"
-        
-        "🔍 <b>SEARCH</b>\n"
-        "  <code>/find &lt;query&gt; [--folder &lt;name&gt;]</code>\n"
-        "    AI-powered semantic search across your links\n"
-        "    Example: <code>/find how to learn Python</code>\n\n"
-        
-        "🤝 <b>SHARING & ACCESS CONTROL</b>\n"
-        "  <code>/share &lt;name&gt; [--write]</code>\n"
-        "    Generate a share key for a folder\n"
-        "    Default: read-only access\n"
-        "    Add <code>--write</code> to allow others to add links\n"
-        "    Example: <code>/share Work --write</code>\n\n"
-        "  <code>/join &lt;access_key&gt;</code>\n"
-        "    Join a shared folder using an access key\n"
-        "    Example: <code>/join Work_x7k9m2</code>\n\n"
-        "  <code>/revoke &lt;name&gt;</code>\n"
-        "    Revoke all access to a shared folder (owner only)\n"
-        "    All shared links become invalid immediately\n\n"
-        "  <code>/share_list &lt;name&gt;</code>\n"
-        "    Show all users with access to a shared folder\n"
-        "    Displays user IDs and their access mode (read/write)\n\n"
-        
-        "💬 <b>NATURAL LANGUAGE COMMANDS</b>\n"
-        "  Instead of /commands, just type:\n"
-        "  <code>find python tutorial</code> — Search links\n"
-        "  <code>show folders</code> — List folders\n"
-        "  <code>open Work</code> — View folder\n"
-        "  <code>create folder Learning</code> — Create folder\n"
-        "  <code>delete folder Old</code> — Delete folder\n"
-        "  <code>add https://ex.com \"desc\"</code> — Add link\n\n"
-        
-        "🔐 <b>ACCESS LEVELS</b>\n"
-        "  <b>Owner:</b> Full control (add/delete/share/revoke)\n"
-        "  <b>Write:</b> Read + add own links + delete own links\n"
-        "  <b>Read:</b> View links only (cannot modify)\n\n"
-        
-        "❓ <b>Need help?</b> Just ask! I understand natural language.",
+        "👋 Hi! I'm a bot for saving and searching links.\n\n"
+        "📂 <b>Folders:</b>\n"
+        "  /folders — list your folders\n"
+        "  /create <code>name</code> — create a folder\n"
+        "  /folder <code>name</code> — show links in a folder\n"
+        "  /delete_folder <code>name</code> — delete an empty folder\n\n"
+        "📎 <b>/add</b> <code>url \"description\" [--folder name]</code> — save a link\n"
+        "🔍 <b>/find</b> <code>query [--folder name]</code> — find relevant links\n"
+        "🗑 <b>/delete</b> <code>url</code> — delete link(s) by URL\n"
+        "✏️ <b>/edit</b> <code>url \"new description\"</code> — edit description\n"
+        "📋 <b>/list</b> — show all your links\n\n"
+        "💡 <b>Natural language:</b>\n"
+        "  <code>покажи папки</code>, <code>удали папку Work</code>, <code>найди python</code>\n\n"
+        "Example: <code>/add https://docs.python.org \"official Python docs\" --folder Work</code>",
         parse_mode="HTML",
     )
 
@@ -1082,20 +817,6 @@ async def cmd_add(message: Message):
     # Resolve folder
     if folder_name:
         folder = await get_folder_by_name(DB_POOL, user_id, folder_name)
-        is_shared_folder = False
-
-        # If not found in own folders, check shared folders
-        if folder is None:
-            shared_folders_list = await get_user_shared_folders(DB_POOL, user_id)
-            for sf in shared_folders_list:
-                if sf["name"].lower() == folder_name.lower():
-                    # Check if user has access
-                    has_access = await has_folder_access(DB_POOL, sf["id"], user_id)
-                    if has_access:
-                        folder = sf
-                        is_shared_folder = True
-                    break
-
         if folder is None:
             await message.answer(
                 f"❌ Folder '<code>{folder_name}</code>' not found.\n"
@@ -1103,25 +824,11 @@ async def cmd_add(message: Message):
                 parse_mode="HTML",
             )
             return
-
         folder_id = folder["id"]
-        folder_is_shared = is_shared_folder
-        
-        # Check if user has write access for shared folders
-        if folder_is_shared:
-            access_mode = await get_user_access_mode(DB_POOL, folder_id, user_id)
-            if access_mode != 'write':
-                await message.answer(
-                    f"❌ You only have read access to folder '<code>{folder_name}</code>'.\n"
-                    f"Ask the owner to grant you write access.",
-                    parse_mode="HTML",
-                )
-                return
     else:
         # Auto-create user folder on first link add
         username = message.from_user.username
         folder_id = await ensure_user_folder(DB_POOL, user_id, username)
-        folder_is_shared = False
 
     # Check for duplicate URL
     existing = await find_link_by_url(DB_POOL, user_id, url)
@@ -1140,11 +847,7 @@ async def cmd_add(message: Message):
     try:
         link_id = await add_link(DB_POOL, user_id, url, description, folder_id)
         folder = await get_folder_by_id(DB_POOL, folder_id)
-        if folder:
-            icon = "🔗" if folder_is_shared else "📁"
-            folder_text = f" | {icon} {folder['name']}"
-        else:
-            folder_text = ""
+        folder_text = f" | 📁 {folder['name']}" if folder else ""
         await message.answer(
             f"✅ Link saved!\n"
             f"🆔 ID: <code>{link_id}</code>{folder_text}\n"
@@ -1161,7 +864,7 @@ async def cmd_add(message: Message):
 async def cmd_find_logic(message: Message, query: str, folder_name: str | None = None):
     """
     Core find logic — search links using LLM.
-    Searches across ALL user folders + shared folders + System folder.
+    Searches across ALL user folders + System folder.
     """
     global DB_POOL
 
@@ -1172,17 +875,6 @@ async def cmd_find_logic(message: Message, query: str, folder_name: str | None =
     folder_text = ""
     if folder_name:
         folder = await get_folder_by_name(DB_POOL, user_id, folder_name)
-        
-        # If not found in own folders, check shared folders
-        if folder is None:
-            shared_folders_list = await get_user_shared_folders(DB_POOL, user_id)
-            for sf in shared_folders_list:
-                if sf["name"].lower() == folder_name.lower():
-                    has_access = await has_folder_access(DB_POOL, sf["id"], user_id)
-                    if has_access:
-                        folder = sf
-                    break
-        
         if folder is None:
             await message.answer(
                 f"❌ Folder '<code>{folder_name}</code>' not found.",
@@ -1204,28 +896,18 @@ async def cmd_find_logic(message: Message, query: str, folder_name: str | None =
             await message.answer(result_text, disable_web_page_preview=True, parse_mode="HTML")
             return
 
-    # Gather links: user's links (all folders) + shared folders + System links
+    # Gather links: user's links (all folders) + System links
     if folder_id is not None:
         # Filtered by specific folder
         links = await get_folder_links(DB_POOL, folder_id)
     else:
-        # All user links across all folders + shared folders + System links
+        # All user links across all folders + System links
         user_links = await get_all_user_links(DB_POOL, user_id)
-        
-        # Add links from shared folders
-        shared_folders_list = await get_user_shared_folders(DB_POOL, user_id)
-        shared_links = []
-        for sf in shared_folders_list:
-            sf_links = await get_folder_links(DB_POOL, sf["id"])
-            shared_links.extend(sf_links)
-        
-        # System links
         system_folder = await get_system_folder(DB_POOL)
         system_links = []
         if system_folder:
             system_links = await get_folder_links(DB_POOL, system_folder["id"])
-        
-        links = user_links + shared_links + system_links
+        links = user_links + system_links
 
     if not links:
         folder_hint = f" in folder '<code>{folder_name}</code>'" if folder_name else ""
@@ -1314,35 +996,19 @@ async def cmd_find(message: Message):
 
 @router.message(Command("list"))
 async def cmd_list(message: Message):
-    """Handle /list command — show all user's saved links grouped by folder (own + shared + system)."""
+    """Handle /list command — show all user's saved links grouped by folder."""
     global DB_POOL
 
     user_id = message.from_user.id
 
-    # Get all user links (JOIN query) + shared folder links + system links
+    # Get all user links (JOIN query) + system links
     user_links = await get_all_user_links(DB_POOL, user_id)
-    
-    # Add links from shared folders
-    shared_folders_list = await get_user_shared_folders(DB_POOL, user_id)
-    shared_links = []
-    for sf in shared_folders_list:
-        sf_links = await get_folder_links(DB_POOL, sf["id"])
-        # Mark shared links with folder info
-        for link in sf_links:
-            link["is_shared"] = True
-            link["folder_name"] = sf["name"]
-        shared_links.extend(sf_links)
-    
-    # System links
     system_folder = await get_system_folder(DB_POOL)
     system_links = []
     if system_folder:
         system_links = await get_folder_links(DB_POOL, system_folder["id"])
-        for link in system_links:
-            link["is_system"] = True
-            link["folder_name"] = SYSTEM_FOLDER_NAME
 
-    all_links = user_links + shared_links + system_links
+    all_links = user_links + system_links
     if not all_links:
         await message.answer("📭 You don't have any saved links yet.", parse_mode="HTML")
         return
@@ -1357,12 +1023,7 @@ async def cmd_list(message: Message):
 
     text = f"📋 Your saved links ({len(all_links)}):\n\n"
     for fname, flinks in sorted(folder_map.items()):
-        if fname == SYSTEM_FOLDER_NAME:
-            icon = "🔒"
-        elif flinks[0].get("is_shared"):
-            icon = "🔗"
-        else:
-            icon = "📁"
+        icon = "🔒" if fname == SYSTEM_FOLDER_NAME else "📁"
         text += f"{icon} <b>{fname}</b> ({len(flinks)}):\n"
         for link in flinks:
             text += f"  🆔 {link['id']} | <a href=\"{link['url']}\">{link['description']}</a>\n"
@@ -1377,52 +1038,32 @@ async def cmd_list(message: Message):
 
 @router.message(Command("folders"))
 async def cmd_folders(message: Message):
-    """Handle /folders command — list user's folders + shared + System."""
+    """Handle /folders command — list user's folders + System."""
     global DB_POOL
 
     user_id = message.from_user.id
 
-    # Get user's own folders (single JOIN query with counts)
-    own_folders = await get_user_folders(DB_POOL, user_id)
-
-    # Get shared folders (folders shared with this user)
-    shared_folders_list = await get_user_shared_folders(DB_POOL, user_id)
+    # Get user folders (single JOIN query with counts)
+    folders = await get_user_folders(DB_POOL, user_id)
 
     # Also show System folder
     system_folder = await get_system_folder(DB_POOL)
+    if system_folder:
+        folders.append(system_folder)
 
-    # Check if we have any folders at all
-    has_any = own_folders or shared_folders_list or system_folder
-    if not has_any:
+    if not folders:
         await message.answer(
             "📂 You don't have any folders yet.\n"
             "Add a link to auto-create your folder: <code>/add url \"desc\"</code>\n"
-            "Or create manually: <code>/create name</code>\n"
-            "Or join a shared folder: <code>/join access_key</code>",
+            "Or create manually: <code>/create name</code>",
             parse_mode="HTML",
         )
         return
 
     text = "📂 Your folders:\n\n"
-
-    # Own folders
-    if own_folders:
-        text += "📁 <b>My folders:</b>\n"
-        for folder in own_folders:
-            text += f"  📁 <code>{folder['name']}</code> — {folder['links_count']} links\n"
-        text += "\n"
-
-    # Shared folders
-    if shared_folders_list:
-        text += "🔗 <b>Shared with me:</b>\n"
-        for folder in shared_folders_list:
-            text += f"  🔗 <code>{folder['name']}</code> (shared)\n"
-        text += "\n"
-
-    # System folder
-    if system_folder:
-        text += "🔒 <b>System:</b>\n"
-        text += f"  🔒 <code>{system_folder['name']}</code> — {system_folder['links_count']} links\n"
+    for folder in folders:
+        icon = "🔒" if folder["is_system"] else "📁"
+        text += f"{icon} <code>{folder['name']}</code> — {folder['links_count']} links\n"
 
     await message.answer(text, parse_mode="HTML")
 
@@ -1482,34 +1123,12 @@ async def cmd_folder(message: Message):
 
     # Look up folder: user's folders first, then System
     folder = await get_folder_by_name(DB_POOL, user_id, name)
-    is_shared = False
-    
     if folder is None and name == SYSTEM_FOLDER_NAME:
         folder = await get_system_folder(DB_POOL)
-    
-    # If not found in own folders, check shared folders
-    if folder is None:
-        shared_folders_list = await get_user_shared_folders(DB_POOL, user_id)
-        for sf in shared_folders_list:
-            if sf["name"].lower() == name.lower():
-                folder = sf
-                is_shared = True
-                break
 
     if folder is None:
         await message.answer(f"❌ Folder '<code>{name}</code>' not found.", parse_mode="HTML")
         return
-
-    # Check access for shared folders
-    if is_shared:
-        has_access = await has_folder_access(DB_POOL, folder["id"], user_id)
-        if not has_access:
-            await message.answer(
-                f"❌ You don't have access to folder '<code>{name}</code>'.\n"
-                f"Ask the owner to share it with you.",
-                parse_mode="HTML",
-            )
-            return
 
     # Get links with JOIN
     links = await get_folder_links(DB_POOL, folder["id"])
@@ -1521,15 +1140,7 @@ async def cmd_folder(message: Message):
         )
         return
 
-    # Choose icon based on folder type
-    if folder.get("is_system"):
-        icon = "🔒"
-    elif is_shared:
-        icon = "🔗"
-    else:
-        icon = "📁"
-
-    text = f"{icon} <b>{name}</b> ({len(links)} links):\n\n"
+    text = f"📁 <b>{name}</b> ({len(links)} links):\n\n"
     for link in links:
         text += f"🆔 {link['id']} | <a href=\"{link['url']}\">{link['description']}</a>\n"
 
@@ -1579,240 +1190,6 @@ async def cmd_delete_folder(message: Message):
 
 
 # ---------------------------------------------------------------------------
-# Share folder command
-# ---------------------------------------------------------------------------
-
-@router.message(Command("share"))
-async def cmd_share(message: Message):
-    """Handle /share command — generate or show share key for a folder."""
-    global DB_POOL
-
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "❌ Please provide a folder name to share.\n"
-            "Example: <code>/share Work</code> (read-only)\n"
-            "Example: <code>/share Work --write</code> (read+write)",
-            parse_mode="HTML",
-        )
-        return
-
-    full_args = args[1].strip()
-    
-    # Parse --write flag
-    mode = 'read'
-    if '--write' in full_args.lower():
-        mode = 'write'
-        full_args = re.sub(r'--write', '', full_args, flags=re.IGNORECASE).strip()
-    
-    name = full_args.strip()
-    user_id = message.from_user.id
-
-    # Cannot share System folder
-    if name.lower() == SYSTEM_FOLDER_NAME.lower():
-        await message.answer("🔒 Cannot share the System folder.", parse_mode="HTML")
-        return
-
-    # Find the folder
-    folder = await get_folder_by_name(DB_POOL, user_id, name)
-    if folder is None:
-        await message.answer(f"❌ Folder '<code>{name}</code>' not found.", parse_mode="HTML")
-        return
-
-    # Check if folder already has a share key
-    existing_key_info = await get_existing_share_key(DB_POOL, folder["id"])
-    if existing_key_info:
-        mode_icon = "📖" if existing_key_info["mode"] == "read" else "✏️"
-        await message.answer(
-            f"🔗 Folder '<code>{folder['name']}</code>' is already shared!\n"
-            f"{mode_icon} Share key: <code>{existing_key_info['access_key']}</code>\n"
-            f"🔐 Mode: <code>{existing_key_info['mode']}</code>\n\n"
-            f"Share this key with others so they can access the folder.",
-            parse_mode="HTML",
-        )
-        return
-
-    # Generate new share key
-    access_key = generate_share_key(folder["name"])
-    await create_share_key(DB_POOL, folder["id"], user_id, access_key, mode)
-
-    mode_icon = "📖" if mode == "read" else "✏️"
-    mode_text = "read-only" if mode == "read" else "read+write"
-    
-    await message.answer(
-        f"✅ Folder '<code>{folder['name']}</code>' is now shared!\n"
-        f"{mode_icon} Share key: <code>{access_key}</code>\n"
-        f"🔐 Mode: <code>{mode_text}</code>\n\n"
-        f"Share this key with others so they can access the folder.",
-        parse_mode="HTML",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Join shared folder command
-# ---------------------------------------------------------------------------
-
-@router.message(Command("join"))
-async def cmd_join(message: Message):
-    """Handle /join command — join a shared folder using an access key."""
-    global DB_POOL
-
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "❌ Please provide a share key to join.\n"
-            "Example: <code>/join Work_x7k9m2</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    access_key = args[1].strip()
-    user_id = message.from_user.id
-
-    # Find folder by share key
-    folder_info = await get_folder_by_share_key(DB_POOL, access_key)
-    if folder_info is None:
-        await message.answer(
-            "❌ Invalid or expired share key.\n"
-            "Please check the key and try again.",
-            parse_mode="HTML",
-        )
-        return
-
-    # Check if user already has access
-    has_access = await has_folder_access(DB_POOL, folder_info["id"], user_id)
-    if has_access:
-        await message.answer(
-            f"ℹ️ You already have access to folder '<code>{folder_info['name']}</code>'.",
-            parse_mode="HTML",
-        )
-        return
-
-    # Grant access with the same mode as the share key
-    await grant_folder_access(DB_POOL, folder_info["id"], user_id, folder_info["created_by"], folder_info["mode"])
-
-    mode_icon = "📖" if folder_info["mode"] == "read" else "✏️"
-    mode_text = "read-only" if folder_info["mode"] == "read" else "read+write"
-
-    await message.answer(
-        f"✅ Доступ к папке '<code>{folder_info['name']}</code>' получен!\n"
-        f"{mode_icon} Mode: <code>{mode_text}</code>\n\n"
-        f"You can now view it with: <code>/folder {folder_info['name']}</code>",
-        parse_mode="HTML",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Revoke shared folder access command
-# ---------------------------------------------------------------------------
-
-@router.message(Command("revoke"))
-async def cmd_revoke(message: Message):
-    """Handle /revoke command — revoke access to a shared folder (owner only)."""
-    global DB_POOL
-
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "❌ Please provide a folder name to revoke.\n"
-            "Example: <code>/revoke Work</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    name = args[1].strip()
-    user_id = message.from_user.id
-
-    # Cannot revoke System folder
-    if name.lower() == SYSTEM_FOLDER_NAME.lower():
-        await message.answer("🔒 Cannot revoke access to the System folder.", parse_mode="HTML")
-        return
-
-    # Find the folder
-    folder = await get_folder_by_name(DB_POOL, user_id, name)
-    if folder is None:
-        await message.answer(f"❌ Folder '<code>{name}</code>' not found.", parse_mode="HTML")
-        return
-
-    # Try to revoke the share key
-    success, msg = await revoke_share_key(DB_POOL, folder["id"], user_id)
-
-    if success:
-        await message.answer(
-            f"🔒 Access revoked for folder '<code>{msg}</code>'. Shared links are no longer available.",
-            parse_mode="HTML",
-        )
-    else:
-        await message.answer(f"❌ {msg}", parse_mode="HTML")
-
-
-# ---------------------------------------------------------------------------
-# Share list command
-# ---------------------------------------------------------------------------
-
-@router.message(Command("share_list"))
-async def cmd_share_list(message: Message):
-    """Handle /share_list command — show who has access to a shared folder."""
-    global DB_POOL
-
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "❌ Please provide a folder name.\n"
-            "Example: <code>/share_list Work</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    name = args[1].strip()
-    user_id = message.from_user.id
-
-    # Cannot list System folder
-    if name.lower() == SYSTEM_FOLDER_NAME.lower():
-        await message.answer("🔒 Cannot list access for the System folder.", parse_mode="HTML")
-        return
-
-    # Find the folder
-    folder = await get_folder_by_name(DB_POOL, user_id, name)
-    if folder is None:
-        await message.answer(f"❌ Folder '<code>{name}</code>' not found.", parse_mode="HTML")
-        return
-
-    # Check if folder is shared
-    share_key_info = await get_existing_share_key(DB_POOL, folder["id"])
-    if not share_key_info:
-        await message.answer(
-            f"❌ Folder '<code>{name}</code>' is not shared.\n"
-            f"Share it first with: <code>/share {name}</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    # Get all users with access
-    users = await get_shared_folder_users(DB_POOL, folder["id"])
-
-    if not users:
-        await message.answer(
-            f"🔗 Folder '<code>{name}</code>' is shared, but no one has joined yet.\n"
-            f"🔑 Share key: <code>{share_key_info['access_key']}</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    # Build response
-    mode_icon_map = {"read": "📖", "write": "✏️"}
-    text = f"🔗 Users with access to '<code>{name}</code>':\n\n"
-    
-    for user in users:
-        icon = mode_icon_map.get(user["mode"], "❓")
-        text += f"{icon} User ID: <code>{user['user_id']}</code> — {user['mode']}\n"
-    
-    text += f"\n🔑 Share key: <code>{share_key_info['access_key']}</code>"
-
-    await message.answer(text, parse_mode="HTML")
-
-
-# ---------------------------------------------------------------------------
 # Delete command (by URL)
 # ---------------------------------------------------------------------------
 
@@ -1845,45 +1222,7 @@ async def cmd_delete(message: Message):
         await message.answer("🔒 Cannot delete links from the System folder.", parse_mode="HTML")
         return
 
-    # Filter links based on ownership and access rights
-    deletable_links = []
-    for link in matching:
-        # Skip system links
-        if link["is_system"]:
-            continue
-        
-        # Check if it's the user's own link (user_id matches)
-        if link.get("user_id") == user_id:
-            deletable_links.append(link)
-            continue
-        
-        # For shared folders, check if user is the folder owner
-        folder = await get_folder_by_id(DB_POOL, link["folder_id"])
-        if folder and folder["user_id"] == user_id:
-            # User owns the folder, can delete any link in it
-            deletable_links.append(link)
-            continue
-        
-        # For shared folders with write access, can only delete own links
-        if folder:
-            access_mode = await get_user_access_mode(DB_POOL, folder["id"], user_id)
-            if access_mode == 'write' and link.get("user_id") == user_id:
-                deletable_links.append(link)
-
-    if not deletable_links:
-        await message.answer(
-            "🔒 Cannot delete these links (they belong to other users or you don't have permission).",
-            parse_mode="HTML",
-        )
-        return
-
-    # Delete only the links the user has permission to delete
-    deleted = 0
-    for link in deletable_links:
-        await delete_links_by_url(DB_POOL, user_id, url)
-        deleted += 1
-        break  # delete_links_by_url already handles multiple links with same URL
-
+    deleted = await delete_links_by_url(DB_POOL, user_id, url)
     if deleted == 0:
         await message.answer("🔒 Cannot delete these links (they may be from the System folder).", parse_mode="HTML")
         return
@@ -1943,173 +1282,117 @@ async def cmd_edit(message: Message):
 
 
 # ---------------------------------------------------------------------------
-# LLM-based intent routing
-# ---------------------------------------------------------------------------
-
-async def route_intent(text: str) -> dict:
-    """Отправляет текст в LLM, получает JSON с intent и entities."""
-    system_prompt = """Ты — роутер команд для Telegram бота. Определи намерение пользователя.
-
-Intent'ы:
-- search — поиск ссылок (entities: query)
-- add — добавить ссылку (entities: url, description, folder?)
-- list_links — показать все ссылки пользователя (entities: {})
-- list_folders — показать папки
-- create_folder — создать папку (entities: name)
-- share — поделиться папкой (entities: folder_name)
-- join — присоединиться по ключу (entities: access_key)
-- delete_link — удалить ссылку (entities: url или link_id)
-- delete_folder — удалить папку (entities: folder_name)
-- edit — изменить описание (entities: url, new_description)
-- help — показать справку
-
-Примеры:
-- "найди python" → {"intent": "search", "entities": {"query": "python"}}
-- "find python docs" → {"intent": "search", "entities": {"query": "python docs"}}
-- "show all links" → {"intent": "list_links", "entities": {}}
-- "show all urls" → {"intent": "list_links", "entities": {}}
-- "покажи все ссылки" → {"intent": "list_links", "entities": {}}
-- "add https://python.org docs" → {"intent": "add", "entities": {"url": "https://python.org", "description": "docs"}}
-- "добавь https://python.org документация" → {"intent": "add", "entities": {"url": "https://python.org", "description": "документация"}}
-- "покажи папки" → {"intent": "list_folders", "entities": {}}
-- "удали папку Work" → {"intent": "delete_folder", "entities": {"name": "Work"}}
-- "удали https://python.org" → {"intent": "delete_link", "entities": {"url": "https://python.org"}}
-- "помощь" → {"intent": "help", "entities": {}}
-
-Верни ТОЛЬКО JSON, без пояснений."""
-
-    llm = LLMClient(LLM_API_BASE_URL, LLM_API_KEY, LLM_MODEL)
-    response = await llm.ask(system_prompt, f"Текст пользователя: {text}")
-    return json.loads(response)
-
-
-# ---------------------------------------------------------------------------
 # Generic text message handler (messages without / commands)
 # ---------------------------------------------------------------------------
 
 @router.message(F.text)
 async def handle_text(message: Message):
-    """Handle plain text messages (no / command) with LLM-based intent routing."""
+    """Handle plain text messages (no / command) with morphological analysis."""
     if not message.text:
         return
-    
+
     text = message.text.strip()
     logger.info(f"handle_text received: {text}")
+
+    # =========================================================================
+    # PRIORITY 1: Folder commands (list, create, delete, view)
+    # =========================================================================
+    is_folder, folder_action = is_folder_command(text)
     
-    try:
-        intent_data = await route_intent(text)
-        intent = intent_data.get("intent")
-        entities = intent_data.get("entities", {})
-        
-        logger.info(f"LLM intent: {intent}, entities: {entities}")
-        
-        if intent == "search":
-            query = entities.get("query", text)
-            await cmd_find_logic(message, query)
-            
-        elif intent == "add":
-            url = entities.get("url", "")
-            description = entities.get("description", "")
-            folder = entities.get("folder", "")
-            
-            if not url or not description:
-                await message.answer(
-                    "📎 Please provide URL and description.\n"
-                    "Example: <code>/add https://example.com \"my site\"</code>",
-                    parse_mode="HTML",
-                )
-                return
-            
-            # Construct command for existing handler
-            if folder:
-                message.text = f'/add {url} "{description}" --folder {folder}'
-            else:
-                message.text = f'/add {url} "{description}"'
-            await cmd_add(message)
-            
-        elif intent == "list_folders":
+    if is_folder:
+        if folder_action == "__LIST__":
+            # Show folder list
+            logger.info("Folder list command detected via morphological analysis")
             await cmd_folders(message)
-
-        elif intent == "list_links":
-            await cmd_list(message)
-
-        elif intent == "create_folder":
-            name = entities.get("name", "")
-            if not name:
-                await message.answer("❌ Please provide a folder name.", parse_mode="HTML")
-                return
-            message.text = f"/create {name}"
-            await cmd_create(message)
-            
-        elif intent == "share":
-            folder_name = entities.get("folder_name", "")
-            if not folder_name:
-                await message.answer("❌ Please provide a folder name to share.", parse_mode="HTML")
-                return
-            message.text = f"/share {folder_name}"
-            await cmd_share(message)
-            
-        elif intent == "join":
-            access_key = entities.get("access_key", "")
-            if not access_key:
-                await message.answer("❌ Please provide an access key.", parse_mode="HTML")
-                return
-            message.text = f"/join {access_key}"
-            await cmd_join(message)
-            
-        elif intent == "delete_link":
-            if "link_id" in entities:
-                await message.answer(
-                    "❌ Deletion by ID is not supported. Please use URL.\n"
-                    "Example: <code>/delete https://example.com</code>",
-                    parse_mode="HTML",
-                )
-            else:
-                url = entities.get("url", "")
-                if not url:
-                    await message.answer("❌ Please provide a URL to delete.", parse_mode="HTML")
-                    return
-                message.text = f"/delete {url}"
-                await cmd_delete(message)
-            
-        elif intent == "delete_folder":
-            folder_name = entities.get("name", "")
-            if not folder_name:
-                await message.answer("❌ Please provide a folder name.", parse_mode="HTML")
-                return
+            return
+        
+        elif folder_action.startswith("__DELETE__"):
+            # Delete folder
+            folder_name = folder_action.replace("__DELETE__", "").capitalize()
+            logger.info(f"Delete folder detected: {folder_name}")
             message.text = f"/delete_folder {folder_name}"
             await cmd_delete_folder(message)
-            
-        elif intent == "edit":
-            url = entities.get("url", "")
-            new_description = entities.get("new_description", "")
-            
-            if not url or not new_description:
-                await message.answer(
-                    "❌ Please provide URL and new description.\n"
-                    "Example: <code>/edit https://example.com \"updated description\"</code>",
-                    parse_mode="HTML",
-                )
-                return
-            message.text = f'/edit {url} "{new_description}"'
-            await cmd_edit(message)
-            
-        elif intent == "help":
-            await cmd_help(message)
-            
+            return
+        
+        elif folder_action.startswith("__CREATE__"):
+            # Create folder
+            folder_name = folder_action.replace("__CREATE__", "")
+            logger.info(f"Create folder detected: {folder_name}")
+            message.text = f"/create {folder_name}"
+            await cmd_create(message)
+            return
+        
         else:
-            logger.warning(f"Unknown intent: {intent}")
-            await cmd_help(message)
-            
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse LLM response as JSON: {e}")
+            # View folder
+            folder_name = folder_action.capitalize()
+            logger.info(f"View folder detected: {folder_name}")
+            message.text = f"/folder {folder_name}"
+            await cmd_folder(message)
+            return
+
+    # =========================================================================
+    # PRIORITY 2: Add link commands
+    # =========================================================================
+    if is_add_command(text):
+        logger.info("Add command detected via morphological analysis")
+        # Extract URL if present
+        url_match = re.search(r'https?://\S+', text)
+        if url_match:
+            url = url_match.group(0).rstrip('.,;:!?)')
+            # Try to extract description (text after URL)
+            url_pos = text.lower().find(url.lower())
+            description = text[url_pos + len(url):].strip().strip('"\'')
+
+            if description and len(description) > 3:
+                message.text = f'/add {url} "{description}"'
+                logger.info(f"Simulating /add with URL and description")
+                await cmd_add(message)
+                return
+
         await message.answer(
-            "❌ Sorry, I couldn't understand that. Please try again or use /help.",
+            "📎 To add a link, use:\n"
+            "<code>/add https://example.com \"description\"</code>\n\n"
+            "Or just send: <code>добавь https://example.com \"моё описание\"</code>",
             parse_mode="HTML",
         )
-    except Exception as e:
-        logger.error(f"Intent routing failed: {e}")
-        await message.answer("Sorry, I didn't understand. Try /help")
+        return
+
+    # =========================================================================
+    # PRIORITY 3: Search commands
+    # =========================================================================
+    is_search, query = is_search_command(text)
+    
+    if is_search:
+        logger.info(f"Search detected via morphological analysis, query: '{query}'")
+
+        if query and len(query) > 1:
+            await cmd_find_logic(message, query)
+        else:
+            await message.answer(
+                "❌ Please provide a search query.\n"
+                "Example: <code>find python tutorial</code> or <code>найди документация python</code>",
+                parse_mode="HTML",
+            )
+        return
+
+    # =========================================================================
+    # FALLBACK: Show help
+    # =========================================================================
+    logger.info("No matching keywords found, showing help message")
+    await message.answer(
+        "👋 I understand natural language commands!\n\n"
+        "🔍 <b>Search:</b>\n"
+        "  <code>find python tutorial</code>\n"
+        "  <code>найди документация python</code>\n\n"
+        "📂 <b>Folders:</b>\n"
+        "  <code>покажи папки</code> — list all folders\n"
+        "  <code>открой Work</code> — show links in folder\n"
+        "  <code>создай папку Learning</code> — create new folder\n"
+        "  <code>удали папку Work</code> — delete empty folder\n\n"
+        "📎 <b>Add links:</b>\n"
+        "  <code>добавь https://example.com \"my site\"</code>\n\n"
+        "Or use traditional commands: /add, /find, /folders, /list, /delete_folder"
+    )
 
 
 # ---------------------------------------------------------------------------
