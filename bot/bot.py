@@ -989,67 +989,31 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     """Handle /help command — show all available commands."""
     await message.answer(
-        "📖 <b>Link Saver Bot — Full Command Reference</b>\n\n"
-        
-        "📂 <b>FOLDER MANAGEMENT</b>\n"
-        "  <code>/create &lt;name&gt;</code>\n"
-        "    Create a new folder\n\n"
-        "  <code>/folders</code>\n"
-        "    List all your folders (own, shared, and system)\n\n"
-        "  <code>/folder &lt;name&gt;</code>\n"
-        "    Show all links in a specific folder\n\n"
-        "  <code>/delete_folder &lt;name&gt;</code>\n"
-        "    Delete an empty folder (must have no links)\n\n"
-        
-        "🔗 <b>LINK MANAGEMENT</b>\n"
-        "  <code>/add &lt;url&gt; \"&lt;description&gt;\" [--folder &lt;name&gt;]</code>\n"
-        "    Save a link with description to a folder\n"
-        "    Example: <code>/add https://python.org \"Python docs\" --folder Work</code>\n\n"
-        "  <code>/delete &lt;url&gt;</code>\n"
-        "    Delete your link(s) by URL\n"
-        "    Note: Can only delete your own links (or all if you own the folder)\n\n"
-        "  <code>/edit &lt;url&gt; \"&lt;new description&gt;\"</code>\n"
-        "    Update the description of an existing link\n\n"
-        "  <code>/list</code>\n"
-        "    Show all your links grouped by folder\n\n"
-        
-        "🔍 <b>SEARCH</b>\n"
-        "  <code>/find &lt;query&gt; [--folder &lt;name&gt;]</code>\n"
-        "    AI-powered semantic search across your links\n"
-        "    Example: <code>/find how to learn Python</code>\n\n"
-        
-        "🤝 <b>SHARING & ACCESS CONTROL</b>\n"
-        "  <code>/share &lt;name&gt; [--write]</code>\n"
-        "    Generate a share key for a folder\n"
-        "    Default: read-only access\n"
-        "    Add <code>--write</code> to allow others to add links\n"
-        "    Example: <code>/share Work --write</code>\n\n"
-        "  <code>/join &lt;access_key&gt;</code>\n"
-        "    Join a shared folder using an access key\n"
-        "    Example: <code>/join Work_x7k9m2</code>\n\n"
-        "  <code>/revoke &lt;name&gt;</code>\n"
-        "    Revoke all access to a shared folder (owner only)\n"
-        "    All shared links become invalid immediately\n\n"
-        "  <code>/share_list &lt;name&gt;</code>\n"
-        "    Show all users with access to a shared folder\n"
-        "    Displays user IDs and their access mode (read/write)\n\n"
-        
-        "💬 <b>NATURAL LANGUAGE COMMANDS</b>\n"
-        "  Instead of /commands, just type:\n"
-        "  <code>find python tutorial</code> — Search links\n"
-        "  <code>show folders</code> — List folders\n"
-        "  <code>open Work</code> — View folder\n"
-        "  <code>create folder Learning</code> — Create folder\n"
-        "  <code>delete folder Old</code> — Delete folder\n"
-        "  <code>add https://ex.com \"desc\"</code> — Add link\n\n"
-        
-        "🔐 <b>ACCESS LEVELS</b>\n"
-        "  <b>Owner:</b> Full control (add/delete/share/revoke)\n"
-        "  <b>Write:</b> Read + add own links + delete own links\n"
-        "  <b>Read:</b> View links only (cannot modify)\n\n"
-        
-        "❓ <b>Need help?</b> Just ask! I understand natural language.",
-        parse_mode="HTML",
+        "📚 **Core Commands** (always work)\n\n"
+        "📎 `/add <url> \"<description>\" [--folder <name>]` — Save a link\n"
+        "🔍 `/find <query> [--folder <name>]` — Search links with AI\n"
+        "📂 `/folders` — List all your folders\n"
+        "📁 `/create <name>` — Create a new folder\n"
+        "📂 `/folder <name>` — Open a folder\n"
+        "📋 `/list` — Show all your links\n\n"
+        "🔧 **Advanced Features** (commands only)\n"
+        "🔗 `/share <name> [--write]` — Generate share key for a folder\n"
+        "🔑 `/join <access_key>` — Join a shared folder\n"
+        "📡 `/share_list <name>` — See who has access to a folder\n"
+        "🚫 `/revoke <name>` — Revoke access (owner only)\n"
+        "🗑 `/delete_folder <name>` — Delete an empty folder\n"
+        "✏️ `/edit <url> \"<new description>\"` — Edit link description\n"
+        "🗑 `/delete <url>` — Delete a link by URL\n\n"
+        "🤖 **Natural Language** (experimental)\n"
+        "• `find python tutorial` — Search links\n"
+        "• `add https://python.org docs` — Save a link\n"
+        "• `show all my links` — List all links\n"
+        "• `show folders` — List folders\n"
+        "• `create folder Work` — Create a folder\n"
+        "• `delete folder Old` — Delete a folder\n\n"
+        "💡 **Tip:** For complex operations (sharing, editing, deleting),\n"
+        "use the `/commands` above. For quick actions, just type naturally!",
+        parse_mode="Markdown",
     )
 
 
@@ -1948,33 +1912,28 @@ async def cmd_edit(message: Message):
 
 async def route_intent(text: str) -> dict:
     """Отправляет текст в LLM, получает JSON с intent и entities."""
-    system_prompt = """Ты — роутер команд для Telegram бота. Определи намерение пользователя.
+    system_prompt = """Ты — роутер команд для Telegram бота. Сначала определи, есть ли в сообщении слово-триггер.
 
-Intent'ы:
-- search — поиск ссылок (entities: query)
-- add — добавить ссылку (entities: url, description, folder?)
-- list_links — показать все ссылки пользователя (entities: {})
-- list_folders — показать папки
-- create_folder — создать папку (entities: name)
-- share — поделиться папкой (entities: folder_name)
-- join — присоединиться по ключу (entities: access_key)
-- delete_link — удалить ссылку (entities: url или link_id)
-- delete_folder — удалить папку (entities: folder_name)
-- edit — изменить описание (entities: url, new_description)
-- help — показать справку
+ШАГ 1: Поиск триггеров (синонимов команд):
+- Поиск: ['найди', 'ищу', 'search', 'find', 'lookup', 'where']
+- Добавление: ['добавь', 'сохрани', 'add', 'save', 'store', 'keep', 'bookmark']
+- Список ссылок: ['покажи ссылки', 'list links', 'show all', 'my links']
+- Папки: ['папки', 'folders', 'list folders']
+
+ШАГ 2: Если триггер найден, извлеки сущности:
+- Для добавления: найди URL (https?://\S+) и описание (всё после URL)
+- Для поиска: всё, что после триггера
+
+ШАГ 3: Верни JSON.
 
 Примеры:
-- "найди python" → {"intent": "search", "entities": {"query": "python"}}
-- "find python docs" → {"intent": "search", "entities": {"query": "python docs"}}
-- "show all links" → {"intent": "list_links", "entities": {}}
-- "show all urls" → {"intent": "list_links", "entities": {}}
-- "покажи все ссылки" → {"intent": "list_links", "entities": {}}
-- "add https://python.org docs" → {"intent": "add", "entities": {"url": "https://python.org", "description": "docs"}}
-- "добавь https://python.org документация" → {"intent": "add", "entities": {"url": "https://python.org", "description": "документация"}}
-- "покажи папки" → {"intent": "list_folders", "entities": {}}
-- "удали папку Work" → {"intent": "delete_folder", "entities": {"name": "Work"}}
-- "удали https://python.org" → {"intent": "delete_link", "entities": {"url": "https://python.org"}}
-- "помощь" → {"intent": "help", "entities": {}}
+1. "add https://python.org docs" → {"intent": "add", "entities": {"url": "https://python.org", "description": "docs"}}
+2. "save this link https://github.com" → {"intent": "add", "entities": {"url": "https://github.com", "description": "this link"}}
+3. "find python tutorial" → {"intent": "search", "entities": {"query": "python tutorial"}}
+4. "show all my links" → {"intent": "list_links", "entities": {}}
+5. "python tutorial" → {"intent": "search", "entities": {"query": "python tutorial"}}
+6. "покажи папки" → {"intent": "list_folders", "entities": {}}
+7. "создай папку Work" → {"intent": "create_folder", "entities": {"name": "Work"}}
 
 Верни ТОЛЬКО JSON, без пояснений."""
 
