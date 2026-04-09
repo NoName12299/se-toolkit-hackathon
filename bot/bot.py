@@ -27,11 +27,10 @@ import secrets
 import string
 import sys
 import time
-from contextlib import suppress
 
 import asyncpg
 import httpx
-from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from mawo_pymorphy3 import create_analyzer
@@ -853,12 +852,11 @@ def parse_llm_ids(text: str) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def normalize_english(word: str) -> str:
-    """Простая нормализация английских слов (стемминг)."""
+    """Simple English word normalization (stemming)."""
     word = word.lower()
     if len(word) < 3:
         return word
-    
-    # Убираем распространённые окончания
+
     if word.endswith('ing'):
         word = word[:-3]
     elif word.endswith('ed'):
@@ -874,40 +872,34 @@ def normalize_english(word: str) -> str:
 
 
 def normalize_word(word: str) -> str:
-    """Приводит слово к нормальной форме (русский через pymorphy3, английский через стемминг)."""
+    """Normalize word to its base form (Russian via pymorphy3, English via stemming)."""
     if not word or len(word) < 2:
         return word.lower()
-    
-    # Сначала пробуем русский через pymorphy3
+
     try:
         parsed = analyzer.parse(word)[0]
         return parsed.normal_form
     except Exception:
         pass
-    
-    # Если не получилось — пробуем английскую нормализацию
+
     return normalize_english(word)
 
 
 def is_search_command(text: str) -> tuple[bool, str]:
-    """Проверяет, является ли текст поисковым запросом.
-    Возвращает (is_search, cleaned_query)."""
-    # Удаляем знаки препинания перед обработкой
+    """Check if text is a search query. Returns (is_search, cleaned_query)."""
     text_clean = re.sub(r'[^\w\s]', '', text.lower())
     words = text_clean.split()
 
-    # Слова-триггеры поиска (в нормальной форме + стеммированные варианты)
     search_triggers = {
         'найти', 'искать', 'поискать', 'отыскать', 'разыскать',
-        'search', 'searching', 'search',  # search, searching, searches
-        'find', 'finding', 'find'  # find, finding, finds
+        'search', 'searching', 'search',
+        'find', 'finding', 'find',
     }
 
-    # Удаляем стоп-слова (в нормальной форме)
     stop_words = {
         'пожалуйста', 'помоги', 'можешь', 'можно', 'хочу', 'нужно',
         'please', 'help', 'мне', 'тебе', 'ему', 'ей', 'быстро', 'давай',
-        'где', 'поищи', 'покажи'
+        'где', 'поищи', 'покажи',
     }
 
     cleaned = []
@@ -915,70 +907,61 @@ def is_search_command(text: str) -> tuple[bool, str]:
 
     for word in words:
         normal = normalize_word(word)
-        # Проверяем и нормальную форму, и стеммированную
         if normal in search_triggers or normalize_english(word) in search_triggers:
             is_search = True
-            continue  # не добавляем триггер в запрос
+            continue
         if normal in stop_words:
-            continue  # пропускаем стоп-слова
+            continue
         cleaned.append(word)
 
     return is_search, ' '.join(cleaned)
 
 
 def is_add_command(text: str) -> bool:
-    """Проверяет, является ли текст командой добавления."""
-    # Удаляем знаки препинания перед обработкой
+    """Check if text is an add command."""
     text_clean = re.sub(r'[^\w\s]', '', text.lower())
     words = text_clean.split()
-    
+
     add_triggers = {
         'добавить', 'сохранить', 'запомнить', 'записать',
-        'add', 'adding', 'add',  # add, adding, adds
-        'save', 'saving', 'save'  # save, saving, saves
+        'add', 'adding', 'add',
+        'save', 'saving', 'save',
     }
 
     for word in words:
         normal = normalize_word(word)
-        # Проверяем и нормальную форму, и стеммированную
         if normal in add_triggers or normalize_english(word) in add_triggers:
             return True
     return False
 
 
 def is_folder_command(text: str) -> tuple[bool, str | None]:
-    """Проверяет команды работы с папками.
-    Возвращает (is_command, folder_name или None)."""
-    # Удаляем знаки препинания перед обработкой
+    """Check folder-related commands. Returns (is_command, folder_name or None)."""
     text_lower = re.sub(r'[^\w\s]', '', text.lower())
 
-    # Список папок (поддержка разных форм)
     if any(phrase in text_lower for phrase in [
         'покажи папки', 'список папок', 'мои папки',
-        'folders', 'folder list', 'list folders', 'show folders'
+        'folders', 'folder list', 'list folders', 'show folders',
     ]):
         return True, "__LIST__"
 
-    # Удаление папки (поддержка deleting, removed и т.д.)
     delete_match = re.search(
         r'(?:удали|удалить|delete|deleting|deleted|remove|removing|removed)\s+(?:папку|folder\s+)?(\w+)',
-        text_lower
+        text_lower,
     )
     if delete_match:
         return True, f"__DELETE__{delete_match.group(1)}"
 
-    # Создание папки (поддержка creating, created и т.д.)
     create_match = re.search(
         r'(?:создай|создать|create|creating|created|new|making|made)\s+(?:папку|folder\s+)?(\w+)',
-        text_lower
+        text_lower,
     )
     if create_match:
         return True, f"__CREATE__{create_match.group(1)}"
 
-    # Открытие папки (поддержка showing, opened и т.д.)
     open_match = re.search(
         r'(?:открой|открыть|покажи|show|showing|showed|open|opening|opened|view|viewing)\s+(?:папку|folder\s+)?(\w+)',
-        text_lower
+        text_lower,
     )
     if open_match:
         return True, open_match.group(1)
@@ -1004,7 +987,8 @@ async def cmd_start(message: Message):
         "  1. <code>/create Work</code> — Create your first folder\n"
         "  2. <code>/add https://example.com \"My site\" --Work</code> — Save a link\n"
         "  3. <code>/find python</code> — Search with AI\n"
-        "  4. <code>/share Work</code> — Share with others\n\n"
+        "  4. <code>/share Work</code> — Share with others\n"
+        "  5. <code>/join Work_x7k9m2</code> — Join a shared folder\n\n"
         "📚 <b>Commands:</b> Use /help for full command list\n\n"
         "💡 <b>Tip:</b> You can also use natural language like\n"
         "  <code>find python tutorial</code> or <code>show folders</code>",
@@ -1990,7 +1974,7 @@ async def cmd_edit(message: Message):
 # ---------------------------------------------------------------------------
 
 async def route_intent(text: str) -> dict:
-    """Отправляет текст в LLM, получает JSON с intent и entities."""
+    """Send text to LLM and get JSON with intent and entities."""
     system_prompt = """Ты — роутер команд для Telegram бота. Сначала определи, есть ли в сообщении слово-триггер.
 
 Intent'ы:
