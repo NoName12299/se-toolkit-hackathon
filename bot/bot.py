@@ -499,13 +499,19 @@ async def get_user_links(pool: asyncpg.Pool, user_id: int, folder_id: int | None
         return [{"id": r["id"], "url": r["url"], "description": r["description"], "folder_id": r["folder_id"]} for r in rows]
 
 
-async def find_link_by_url(pool: asyncpg.Pool, user_id: int, url: str) -> dict | None:
-    """Check if a URL already exists for a given user. Returns the link dict or None."""
+async def find_link_by_url(pool: asyncpg.Pool, user_id: int, url: str, folder_id: int | None = None) -> dict | None:
+    """Check if a URL already exists for a given user, optionally filtered by folder. Returns the link dict or None."""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, url, description, folder_id FROM links WHERE user_id = $1 AND url = $2",
-            user_id, url,
-        )
+        if folder_id is not None:
+            row = await conn.fetchrow(
+                "SELECT id, url, description, folder_id FROM links WHERE user_id = $1 AND url = $2 AND folder_id = $3",
+                user_id, url, folder_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT id, url, description, folder_id FROM links WHERE user_id = $1 AND url = $2",
+                user_id, url,
+            )
         if row:
             return {"id": row["id"], "url": row["url"], "description": row["description"], "folder_id": row["folder_id"]}
         return None
@@ -596,6 +602,25 @@ async def get_link_with_folder(pool: asyncpg.Pool, link_id: int) -> dict | None:
             return {
                 "id": row["id"], "url": row["url"], "description": row["description"],
                 "folder_id": row["folder_id"], "folder_name": row["folder_name"], "is_system": row["is_system"],
+            }
+        return None
+
+
+async def get_link_by_id(pool: asyncpg.Pool, user_id: int, link_id: int) -> dict | None:
+    """Get a link by ID, checking ownership. Returns link dict or None."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT l.id, l.user_id, l.url, l.description, l.folder_id, f.name as folder_name, f.is_system, f.user_id as folder_owner_id
+            FROM links l
+            LEFT JOIN folders f ON l.folder_id = f.id
+            WHERE l.id = $1
+        """, link_id)
+        if row:
+            return {
+                "id": row["id"], "user_id": row["user_id"], "url": row["url"],
+                "description": row["description"], "folder_id": row["folder_id"],
+                "folder_name": row["folder_name"], "is_system": row["is_system"],
+                "folder_owner_id": row["folder_owner_id"],
             }
         return None
 
@@ -745,9 +770,11 @@ find_cache = FindCache()
 def parse_add_args(text: str) -> tuple[str, str, str | None] | None:
     """
     Parse '/add https://example.com "my description" --folder Work' → (url, description, folder_name).
+    Also supports shorthand: '/add https://example.com "desc" --Work' → (url, desc, "Work").
     """
     folder_name = None
-    folder_match = re.search(r'--folder\s+(\S+)', text)
+    # Support both --folder Name and --Name shorthand
+    folder_match = re.search(r'--(?:folder\s+)?(\S+)', text)
     if folder_match:
         folder_name = folder_match.group(1)
         text = text[:folder_match.start()] + text[folder_match.end():]
@@ -975,7 +1002,7 @@ async def cmd_start(message: Message):
         "Share folders with your team and collaborate on curated link collections.\n\n"
         "📖 <b>Quick Start:</b>\n"
         "  1. <code>/create Work</code> — Create your first folder\n"
-        "  2. <code>/add https://example.com \"My site\" --folder Work</code> — Save a link\n"
+        "  2. <code>/add https://example.com \"My site\" --Work</code> — Save a link\n"
         "  3. <code>/find python</code> — Search with AI\n"
         "  4. <code>/share Work</code> — Share with others\n\n"
         "📚 <b>Commands:</b> Use /help for full command list\n\n"
@@ -989,30 +1016,31 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     """Handle /help command — show all available commands."""
     await message.answer(
-        "📚 **Core Commands** (always work)\n\n"
-        "📎 `/add <url> \"<description>\" [--folder <name>]` — Save a link\n"
-        "🔍 `/find <query> [--folder <name>]` — Search links with AI\n"
-        "📂 `/folders` — List all your folders\n"
-        "📁 `/create <name>` — Create a new folder\n"
-        "📂 `/folder <name>` — Open a folder\n"
-        "📋 `/list` — Show all your links\n\n"
-        "🔧 **Advanced Features** (commands only)\n"
-        "🔗 `/share <name> [--write]` — Generate share key for a folder\n"
-        "🔑 `/join <access_key>` — Join a shared folder\n"
-        "📡 `/share_list <name>` — See who has access to a folder\n"
-        "🚫 `/revoke <name>` — Revoke access (owner only)\n"
-        "🗑 `/delete_folder <name>` — Delete an empty folder\n"
-        "✏️ `/edit <url> \"<new description>\"` — Edit link description\n"
-        "🗑 `/delete <url>` — Delete a link by URL\n\n"
-        "🤖 **Natural Language** (experimental)\n"
-        "• `find python tutorial` — Search links\n"
-        "• `add https://python.org docs` — Save a link\n"
-        "• `show all my links` — List all links\n"
-        "• `show folders` — List folders\n"
-        "• `create folder Work` — Create a folder\n"
-        "• `delete folder Old` — Delete a folder\n\n"
-        "💡 **Tip:** For complex operations (sharing, editing, deleting),\n"
-        "use the `/commands` above. For quick actions, just type naturally!",
+        "📚 **Basic Commands**\n"
+        "• `/add <url> \"<description>\"` — save a link\n"
+        "  Add `--FolderName` to save to a specific folder\n"
+        "  Example: `/add https://python.org docs --Work`\n"
+        "  Without `--folder`, saves to your personal folder\n"
+        "• `/find <query>` — search links with AI\n"
+        "• `/delete <url or id>` — delete a link by URL or ID\n"
+        "• `/list` — show all my links\n"
+        "• `/folders` — list all my folders\n"
+        "• `/create <name>` — create a new folder\n"
+        "• `/folder <name>` — open a folder\n\n"
+        "🔧 **Advanced Commands**\n"
+        "• `/share <name>` — generate a share key (default: read-only)\n"
+        "  Add `--write` to allow others to add links\n"
+        "• `/join <key>` — join a shared folder\n"
+        "• `/revoke <name>` — revoke access (owner only)\n"
+        "• `/share_list <name>` — show who has access\n"
+        "• `/edit <url> \"<new description>\"` — edit link description\n"
+        "• `/delete_folder <name>` — delete an empty folder\n\n"
+        "🔐 **Access Levels**\n"
+        "• **Read** (default): view links only\n"
+        "• **Write** (`--write`): view + add own links + delete own links\n"
+        "• **Owner**: full control (add/delete/share/revoke)\n\n"
+        "💡 **Tip:** For quick actions, just type naturally.\n"
+        "Example: `add https://python.org docs` or `find python tutorial`",
         parse_mode="Markdown",
     )
 
@@ -1087,8 +1115,8 @@ async def cmd_add(message: Message):
         folder_id = await ensure_user_folder(DB_POOL, user_id, username)
         folder_is_shared = False
 
-    # Check for duplicate URL
-    existing = await find_link_by_url(DB_POOL, user_id, url)
+    # Check for duplicate URL (only in the target folder)
+    existing = await find_link_by_url(DB_POOL, user_id, url, folder_id)
     if existing:
         folder_info = ""
         if existing["folder_id"]:
@@ -1777,87 +1805,138 @@ async def cmd_share_list(message: Message):
 
 
 # ---------------------------------------------------------------------------
-# Delete command (by URL)
+# Delete command (by URL or ID)
 # ---------------------------------------------------------------------------
 
 @router.message(Command("delete"))
 async def cmd_delete(message: Message):
-    """Handle /delete command — delete link(s) by URL."""
+    """Handle /delete command — delete link(s) by URL or ID."""
     global DB_POOL
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer(
-            "❌ Please provide a URL to delete.\n"
-            "Example: <code>/delete https://example.com</code>",
+            "❌ Please provide a URL or link ID to delete.\n"
+            "Example: <code>/delete https://example.com</code>\n"
+            "Example: <code>/delete 123</code>",
             parse_mode="HTML",
         )
         return
 
-    url = args[1].strip()
+    value = args[1].strip()
     user_id = message.from_user.id
 
-    # Check if any links exist with this URL
-    matching = await get_links_by_url(DB_POOL, user_id, url)
-    if not matching:
-        await message.answer("❌ No links found with this URL.", parse_mode="HTML")
-        return
-
-    # Check if all are system links
-    all_system = all(m["is_system"] for m in matching)
-    if all_system:
-        await message.answer("🔒 Cannot delete links from the System folder.", parse_mode="HTML")
-        return
-
-    # Filter links based on ownership and access rights
-    deletable_links = []
-    for link in matching:
-        # Skip system links
+    # Check if value is a numeric ID
+    if value.isdigit():
+        # Delete by ID
+        link_id = int(value)
+        link = await get_link_by_id(DB_POOL, user_id, link_id)
+        
+        if not link:
+            await message.answer("❌ No link found with this ID.", parse_mode="HTML")
+            return
+        
+        # Check permissions
         if link["is_system"]:
-            continue
+            await message.answer("🔒 Cannot delete links from the System folder.", parse_mode="HTML")
+            return
         
-        # Check if it's the user's own link (user_id matches)
-        if link.get("user_id") == user_id:
-            deletable_links.append(link)
-            continue
+        # Check ownership
+        can_delete = False
+        if link["user_id"] == user_id:
+            can_delete = True  # User's own link
+        elif link["folder_owner_id"] == user_id:
+            can_delete = True  # User owns the folder
+        else:
+            # Check write access
+            access_mode = await get_user_access_mode(DB_POOL, link["folder_id"], user_id)
+            if access_mode == 'write' and link["user_id"] == user_id:
+                can_delete = True
         
-        # For shared folders, check if user is the folder owner
-        folder = await get_folder_by_id(DB_POOL, link["folder_id"])
-        if folder and folder["user_id"] == user_id:
-            # User owns the folder, can delete any link in it
-            deletable_links.append(link)
-            continue
+        if not can_delete:
+            await message.answer(
+                "🔒 Cannot delete this link (you don't have permission).",
+                parse_mode="HTML",
+            )
+            return
         
-        # For shared folders with write access, can only delete own links
-        if folder:
-            access_mode = await get_user_access_mode(DB_POOL, folder["id"], user_id)
-            if access_mode == 'write' and link.get("user_id") == user_id:
-                deletable_links.append(link)
-
-    if not deletable_links:
+        # Delete the link
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("DELETE FROM links WHERE id = $1", link_id)
+        
         await message.answer(
-            "🔒 Cannot delete these links (they belong to other users or you don't have permission).",
+            f"🗑 Deleted link #{link_id}:\n"
+            f"🔗 <code>{link['url']}</code>\n"
+            f"📝 {link['description']}",
             parse_mode="HTML",
         )
-        return
+        find_cache.invalidate_user(user_id)
+        
+    else:
+        # Delete by URL (existing logic)
+        url = value
+        
+        # Check if any links exist with this URL
+        matching = await get_links_by_url(DB_POOL, user_id, url)
+        if not matching:
+            await message.answer("❌ No links found with this URL.", parse_mode="HTML")
+            return
 
-    # Delete only the links the user has permission to delete
-    deleted = 0
-    for link in deletable_links:
-        await delete_links_by_url(DB_POOL, user_id, url)
-        deleted += 1
-        break  # delete_links_by_url already handles multiple links with same URL
+        # Check if all are system links
+        all_system = all(m["is_system"] for m in matching)
+        if all_system:
+            await message.answer("🔒 Cannot delete links from the System folder.", parse_mode="HTML")
+            return
 
-    if deleted == 0:
-        await message.answer("🔒 Cannot delete these links (they may be from the System folder).", parse_mode="HTML")
-        return
+        # Filter links based on ownership and access rights
+        deletable_links = []
+        for link in matching:
+            # Skip system links
+            if link["is_system"]:
+                continue
 
-    await message.answer(
-        f"🗑 Deleted {deleted} link(s) with URL:\n"
-        f"<code>{url}</code>",
-        parse_mode="HTML",
-    )
-    find_cache.invalidate_user(user_id)
+            # Check if it's the user's own link (user_id matches)
+            if link.get("user_id") == user_id:
+                deletable_links.append(link)
+                continue
+
+            # For shared folders, check if user is the folder owner
+            folder = await get_folder_by_id(DB_POOL, link["folder_id"])
+            if folder and folder["user_id"] == user_id:
+                # User owns the folder, can delete any link in it
+                deletable_links.append(link)
+                continue
+
+            # For shared folders with write access, can only delete own links
+            if folder:
+                access_mode = await get_user_access_mode(DB_POOL, folder["id"], user_id)
+                if access_mode == 'write' and link.get("user_id") == user_id:
+                    deletable_links.append(link)
+
+        if not deletable_links:
+            await message.answer(
+                "🔒 Cannot delete these links (they belong to other users or you don't have permission).",
+                parse_mode="HTML",
+            )
+            return
+
+        # Delete only the links the user has permission to delete
+        deleted = 0
+        for link in deletable_links:
+            await delete_links_by_url(DB_POOL, user_id, url)
+            deleted += 1
+            break  # delete_links_by_url already handles multiple links with same URL
+
+        if deleted == 0:
+            await message.answer("🔒 Cannot delete these links (they may be from the System folder).", parse_mode="HTML")
+            return
+
+        await message.answer(
+            f"🗑 Deleted {deleted} link(s) with URL:\n"
+            f"<code>{url}</code>",
+            parse_mode="HTML",
+        )
+        find_cache.invalidate_user(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1914,26 +1993,48 @@ async def route_intent(text: str) -> dict:
     """Отправляет текст в LLM, получает JSON с intent и entities."""
     system_prompt = """Ты — роутер команд для Telegram бота. Сначала определи, есть ли в сообщении слово-триггер.
 
+Intent'ы:
+- search — поиск ссылок (entities: query)
+- add — добавить ссылку (entities: url, description, folder?)
+- list_links — показать все ссылки (entities: {})
+- list_folders — показать папки (entities: {})
+- create_folder — создать папку (entities: name)
+- delete_link — удалить ссылку (entities: url или link_id)
+- delete_folder — удалить папку (entities: folder_name)
+- help — показать справку (entities: {})
+
 ШАГ 1: Поиск триггеров (синонимов команд):
 - Поиск: ['найди', 'ищу', 'search', 'find', 'lookup', 'where']
 - Добавление: ['добавь', 'сохрани', 'add', 'save', 'store', 'keep', 'bookmark']
 - Список ссылок: ['покажи ссылки', 'list links', 'show all', 'my links']
 - Папки: ['папки', 'folders', 'list folders']
+- Удаление: ['удали', 'удалить', 'delete', 'remove']
 
 ШАГ 2: Если триггер найден, извлеки сущности:
-- Для добавления: найди URL (https?://\S+) и описание (всё после URL)
+- Для добавления: найди URL (https?://\\S+) и описание (всё после URL)
 - Для поиска: всё, что после триггера
+- Для удаления: URL или числовой ID
 
 ШАГ 3: Верни JSON.
 
 Примеры:
 1. "add https://python.org docs" → {"intent": "add", "entities": {"url": "https://python.org", "description": "docs"}}
-2. "save this link https://github.com" → {"intent": "add", "entities": {"url": "https://github.com", "description": "this link"}}
-3. "find python tutorial" → {"intent": "search", "entities": {"query": "python tutorial"}}
-4. "show all my links" → {"intent": "list_links", "entities": {}}
-5. "python tutorial" → {"intent": "search", "entities": {"query": "python tutorial"}}
-6. "покажи папки" → {"intent": "list_folders", "entities": {}}
-7. "создай папку Work" → {"intent": "create_folder", "entities": {"name": "Work"}}
+2. "add https://github.com my repo" → {"intent": "add", "entities": {"url": "https://github.com", "description": "my repo"}}
+3. "save https://example.com cool site" → {"intent": "add", "entities": {"url": "https://example.com", "description": "cool site"}}
+4. "сохрани https://python.org документация" → {"intent": "add", "entities": {"url": "https://python.org", "description": "документация"}}
+5. "добавь ссылку https://example.com" → {"intent": "add", "entities": {"url": "https://example.com", "description": "https://example.com"}}
+6. "save this link https://github.com" → {"intent": "add", "entities": {"url": "https://github.com", "description": "this link"}}
+7. "find python tutorial" → {"intent": "search", "entities": {"query": "python tutorial"}}
+8. "show all my links" → {"intent": "list_links", "entities": {}}
+9. "python tutorial" → {"intent": "search", "entities": {"query": "python tutorial"}}
+10. "покажи папки" → {"intent": "list_folders", "entities": {}}
+11. "создай папку Work" → {"intent": "create_folder", "entities": {"name": "Work"}}
+12. "delete 123" → {"intent": "delete_link", "entities": {"link_id": 123}}
+13. "delete https://python.org" → {"intent": "delete_link", "entities": {"url": "https://python.org"}}
+14. "удали 123" → {"intent": "delete_link", "entities": {"link_id": 123}}
+15. "удали https://python.org" → {"intent": "delete_link", "entities": {"url": "https://python.org"}}
+16. "remove 123" → {"intent": "delete_link", "entities": {"link_id": 123}}
+17. "remove https://python.org" → {"intent": "delete_link", "entities": {"url": "https://python.org"}}
 
 Верни ТОЛЬКО JSON, без пояснений."""
 
@@ -1951,26 +2052,26 @@ async def handle_text(message: Message):
     """Handle plain text messages (no / command) with LLM-based intent routing."""
     if not message.text:
         return
-    
+
     text = message.text.strip()
     logger.info(f"handle_text received: {text}")
-    
+
     try:
         intent_data = await route_intent(text)
         intent = intent_data.get("intent")
         entities = intent_data.get("entities", {})
-        
+
         logger.info(f"LLM intent: {intent}, entities: {entities}")
-        
+
         if intent == "search":
             query = entities.get("query", text)
             await cmd_find_logic(message, query)
-            
+
         elif intent == "add":
             url = entities.get("url", "")
             description = entities.get("description", "")
             folder = entities.get("folder", "")
-            
+
             if not url or not description:
                 await message.answer(
                     "📎 Please provide URL and description.\n"
@@ -1978,14 +2079,14 @@ async def handle_text(message: Message):
                     parse_mode="HTML",
                 )
                 return
-            
-            # Construct command for existing handler
+
+            # Construct command for existing handler (bypass frozen message)
             if folder:
-                message.text = f'/add {url} "{description}" --folder {folder}'
+                object.__setattr__(message, 'text', f'/add {url} "{description}" --folder {folder}')
             else:
-                message.text = f'/add {url} "{description}"'
+                object.__setattr__(message, 'text', f'/add {url} "{description}"')
             await cmd_add(message)
-            
+
         elif intent == "list_folders":
             await cmd_folders(message)
 
@@ -1997,46 +2098,47 @@ async def handle_text(message: Message):
             if not name:
                 await message.answer("❌ Please provide a folder name.", parse_mode="HTML")
                 return
-            message.text = f"/create {name}"
+            object.__setattr__(message, 'text', f"/create {name}")
             await cmd_create(message)
-            
+
         elif intent == "share":
             folder_name = entities.get("folder_name", "")
             if not folder_name:
                 await message.answer("❌ Please provide a folder name to share.", parse_mode="HTML")
                 return
-            message.text = f"/share {folder_name}"
+            object.__setattr__(message, 'text', f"/share {folder_name}")
             await cmd_share(message)
-            
+
         elif intent == "join":
             access_key = entities.get("access_key", "")
             if not access_key:
                 await message.answer("❌ Please provide an access key.", parse_mode="HTML")
                 return
-            message.text = f"/join {access_key}"
+            object.__setattr__(message, 'text', f"/join {access_key}")
             await cmd_join(message)
-            
+
         elif intent == "delete_link":
             if "link_id" in entities:
-                await message.answer(
-                    "❌ Deletion by ID is not supported. Please use URL.\n"
-                    "Example: <code>/delete https://example.com</code>",
-                    parse_mode="HTML",
-                )
+                link_id = entities.get("link_id")
+                if link_id:
+                    object.__setattr__(message, 'text', f"/delete {link_id}")
+                    await cmd_delete(message)
+                else:
+                    await message.answer("❌ Please provide a link ID to delete.", parse_mode="HTML")
             else:
                 url = entities.get("url", "")
                 if not url:
                     await message.answer("❌ Please provide a URL to delete.", parse_mode="HTML")
                     return
-                message.text = f"/delete {url}"
+                object.__setattr__(message, 'text', f"/delete {url}")
                 await cmd_delete(message)
-            
+
         elif intent == "delete_folder":
             folder_name = entities.get("name", "")
             if not folder_name:
                 await message.answer("❌ Please provide a folder name.", parse_mode="HTML")
                 return
-            message.text = f"/delete_folder {folder_name}"
+            object.__setattr__(message, 'text', f"/delete_folder {folder_name}")
             await cmd_delete_folder(message)
             
         elif intent == "edit":
